@@ -23,7 +23,7 @@ powerbi = PowerBIDataset(
 )
 
 # Set OpenAI API key
-os.environ['OPENAI_API_KEY'] = ''
+os.environ['OPENAI_API_KEY'] = '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'
 
 # Initialize LLM
 smart_llm = OpenAI(temperature=0, timeout=300)
