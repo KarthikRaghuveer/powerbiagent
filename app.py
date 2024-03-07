@@ -1,6 +1,4 @@
 import streamlit as st
-from langchain.chat_models import AzureChatOpenAI
-import openai
 from langchain.utilities import PowerBIDataset
 from langchain.llms import OpenAI
 from powerbiclient.authentication import DeviceCodeLoginAuthentication
