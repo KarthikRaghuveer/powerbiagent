@@ -1,0 +1,176 @@
+import re
+import sqlite3
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS, Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import TextLoader
+from langchain.schema import HumanMessage
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chat_models import AzureChatOpenAI
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.messages import HumanMessage
+
+
+class TableRetriever:
+    def __init__(self, metadata_path, vectorstore_directory, llm):
+        self.metadata_path = metadata_path
+        self.vectorstore_directory = vectorstore_directory
+        self.llm = llm
+
+        # Load metadata and initialize vector store
+        self.loader = TextLoader(self.metadata_path)
+        self.documents = self.loader.load()
+        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+        self.all_splits = self.text_splitter.split_documents(self.documents)
+        self.vectorstore = Chroma.from_documents(
+            documents=self.all_splits,
+            embedding=OpenAIEmbeddings(),
+            persist_directory=self.vectorstore_directory
+        )
+        self.retriever = self.vectorstore.as_retriever(k=4)
+
+        # Define prompts
+        self.SYSTEM_TEMPLATE = """
+        Answer the user's questions based on the below context.
+        Provide the table names and their columns based on the user query:
+
+        <context>
+        {context}
+        </context>
+        """
+        self.question_answering_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", self.SYSTEM_TEMPLATE),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+    def retrieve_tables_and_columns(self, user_query):
+        docs = self.retriever.get_relevant_documents(user_query)
+        document_chain = create_stuff_documents_chain(self.llm, self.question_answering_prompt)
+        response = document_chain.invoke(
+            {
+                "context": docs,
+                "messages": [HumanMessage(content=user_query)],
+            }
+        )
+        return self.parse_response(response)
+
+    def parse_response(self, response):
+        # Implement a parser to extract table names and columns from the response
+        # Example: Convert response to dictionary format
+        return {"artists": ["ArtistId", "Name"]}  # Example output
+
+class CustomSQLAgentWithTableRetriever:
+    def __init__(self, db_connection, table_retriever):
+        self.db_connection = db_connection
+        self.table_retriever = table_retriever
+
+
+    def generate_sql_query(self, tables_and_columns, user_query):
+      # Create a system prompt that includes the table and column information
+      table_info = ""
+      for table, columns in tables_and_columns.items():
+          table_info += f"Table: {table}, Columns: {', '.join(columns)}\n"
+      
+      system_prompt = (
+          f"You have been provided the following table information: {table_info}. "
+          "Generate a valid SQL query using only these tables and columns to answer the user's question. "
+          "Provide a detailed chain of thought reasoning before generating the final SQL query. "
+          "Be careful to only use the column names you can see in the tables provided. "
+          "The query should be enclosed within triple backticks as a code block."
+      )
+
+      messages = [
+          HumanMessage(content=system_prompt),
+          HumanMessage(content=f"User's question: {user_query}")
+      ]
+
+      response = self.table_retriever.llm(messages=messages)
+
+      # Print the response type and content for debugging
+      print(f"Response Type: {type(response)}")
+      print(f"Response Content: {response}")
+
+      # Extract content from the response
+      if hasattr(response, 'content'):
+          response_content = response.content.strip()  # Use `content` attribute if available
+      else:
+          response_content = str(response).strip()  # Fallback to string conversion
+
+      sql_query = self.extract_sql_from_response(response_content)
+
+      # Ensure that the query uses the correct column names
+      if sql_query:
+          for table, columns in tables_and_columns.items():
+              for column in columns:
+                  # Create a dynamic regex pattern for column names
+                  pattern = rf'\b{re.escape(column)}\b'
+                  # Substitute the column names in the SQL query
+                  sql_query = re.sub(pattern, column, sql_query, flags=re.IGNORECASE)
+
+      print(f"Response Content: {response_content}")
+      print(f"Extracted SQL Query: {sql_query}")
+
+      if sql_query:
+          return sql_query
+      else:
+          print("Failed to generate a valid SQL query.")
+          return None
+
+
+    def extract_sql_from_response(self, response_content):
+        # Implement extraction logic for SQL query
+        # Example: Extract SQL query from the response content
+        sql_query = re.search(r'```sql(.*?)```', response_content, re.DOTALL)
+        return sql_query.group(1).strip() if sql_query else None
+
+    def execute_sql_query(self, query):
+        if not isinstance(self.db_connection, sqlite3.Connection):
+            raise ValueError("db_connection must be an instance of sqlite3.Connection")
+
+        print(f"Executing SQL Query: {query}")
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(query)
+            results = cursor.fetchall()
+            return results
+        except Exception as e:
+            print(f"SQL Error: {e}")
+            return None
+
+def main():
+    # Create database connection
+    db_connection = sqlite3.connect('/content/Chinook 1.db')
+
+    # Initialize TableRetriever and CustomSQLAgentWithTableRetriever
+    metadata_path = 'Chinook_metadata.txt'
+    vectorstore_directory = '/content'
+    llm = ChatOpenAI(model="gpt-3.5-turbo-1106", temperature=0) 
+
+    table_retriever = TableRetriever(metadata_path, vectorstore_directory, llm)
+    sql_agent = CustomSQLAgentWithTableRetriever(db_connection, table_retriever)
+
+    # Define a user query
+    user_query = "List all the different Ablum titles."
+
+    # Retrieve tables and columns
+    tables_and_columns = table_retriever.retrieve_tables_and_columns(user_query)
+
+    # Generate SQL query
+    sql_query = sql_agent.generate_sql_query(tables_and_columns, user_query)
+
+    if sql_query:
+        # Execute SQL query
+        query_result = sql_agent.execute_sql_query(sql_query)
+        print(f"Query Result: {query_result}")
+
+if __name__ == "__main__":
+    main()
