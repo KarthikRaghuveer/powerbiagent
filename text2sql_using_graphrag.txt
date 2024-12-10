@@ -56,7 +56,7 @@ NEO4J_URI = "neo4j+s://05163178.databases.neo4j.io"
 NEO4J_USERNAME = "neo4j"
 NEO4J_PASSWORD = "8SoajqvQXE9bVfQpSSXsSJihIwTfB4W0SuR2Cm4Pl0Q"
 os.environ[
-    'OPENAI_API_KEY'] = 'sk-I7aL2GqMF6oywdgawyzUJXeKRCzlCyGIKcrrvmg3U2T3BlbkFJbY57rZN6qLAg-llNpebg_qoJc4CzLfdQzBv8UNKzgA'
+    'OPENAI_API_KEY'] = ''
 
 
 class GraphRAGPipeline:
