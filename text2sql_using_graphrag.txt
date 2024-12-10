@@ -1,0 +1,418 @@
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+import warnings
+
+warnings.filterwarnings("ignore")
+from langchain_community.graphs import Neo4jGraph
+from langchain_community.vectorstores.neo4j_vector import remove_lucene_chars
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_community.vectorstores import Neo4jVector
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
+import json
+import time
+import asyncio
+
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import TokenTextSplitter
+from typing import Tuple, List, Optional
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+from langchain_core.prompts.prompt import PromptTemplate
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import ConfigurableField
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import TokenTextSplitter
+from yfiles_jupyter_graphs import GraphWidget
+from neo4j import GraphDatabase
+import os
+from langchain_community.vectorstores import Neo4jVector
+from langchain_groq import ChatGroq
+import re
+import json
+import os
+import time
+import sqlite3
+from langchain_core.output_parsers import StrOutputParser
+
+NEO4J_URI = "neo4j+s://05163178.databases.neo4j.io"
+NEO4J_USERNAME = "neo4j"
+NEO4J_PASSWORD = "8SoajqvQXE9bVfQpSSXsSJihIwTfB4W0SuR2Cm4Pl0Q"
+os.environ[
+    'OPENAI_API_KEY'] = 'sk-I7aL2GqMF6oywdgawyzUJXeKRCzlCyGIKcrrvmg3U2T3BlbkFJbY57rZN6qLAg-llNpebg_qoJc4CzLfdQzBv8UNKzgA'
+
+
+class GraphRAGPipeline:
+    def __init__(self):
+        self.graph = None
+        self.llm = None
+        self.embedding_model = None
+        self.llm = ChatOpenAI(model="gpt-3.5-turbo-1106", temperature=0)
+
+    def setup(self):
+        self.graph = Neo4jGraph(
+            url=NEO4J_URI,
+            username=NEO4J_USERNAME,
+            password=NEO4J_PASSWORD
+        )
+
+    def load_and_split_documents(self, text_files):
+        documents = []
+        for text_file in text_files:
+            loader = TextLoader(text_file)  # Using TextLoader instead of PyPDFLoader
+            documents.extend(loader.load())
+        text_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=24)
+        return text_splitter.split_documents(documents)
+
+    def add_documents_to_graph(self, documents):
+        llm_transformer = LLMGraphTransformer(llm=self.llm)
+        graph_documents = llm_transformer.convert_to_graph_documents(documents)
+        self.graph.add_graph_documents(
+            graph_documents,
+            baseEntityLabel=True,
+            include_source=True
+        )
+
+
+class EntityExtractor(BaseModel):
+    names: List[str] = Field(..., description="Extracted entities")
+
+
+def generate_full_text_query(input_text):
+    words = [el for el in remove_lucene_chars(input_text).split() if el]
+    query = " AND ".join([f"{word}~2" for word in words])
+    return query
+
+
+class Retriever:
+    def __init__(self, graph, entity_chain, db_path):
+        self.graph = graph
+        self.entity_chain = entity_chain
+        self.llm = None
+        self.db_connection = sqlite3.connect(db_path)
+        self.vector_index = Neo4jVector.from_existing_graph(
+            OpenAIEmbeddings(),
+            url=NEO4J_URI,
+            username=NEO4J_USERNAME,
+            password=NEO4J_PASSWORD,
+            search_type="hybrid",
+            node_label="Document",
+            text_node_properties=["text"],
+            embedding_node_property="embedding"
+        )
+        self.llm = ChatOpenAI(model="gpt-3.5-turbo-1106", temperature=0)
+
+    def structured_retriever(self, question: str) -> str:
+        result = ""
+        entities = self.entity_chain.invoke({"question": question})
+        for entity in entities.names:
+            response = self.graph.query(
+                """CALL db.index.fulltext.queryNodes('entity', $query, {limit:2})
+                YIELD node,score
+                CALL {
+                  WITH node
+                  MATCH (node)-[r:!MENTIONS]->(neighbor)
+                  RETURN node.id + ' - ' + type(r) + ' -> ' + neighbor.id AS output
+                  UNION ALL
+                  WITH node
+                  MATCH (node)<-[r:!MENTIONS]-(neighbor)
+                  RETURN neighbor.id + ' - ' + type(r) + ' -> ' +  node.id AS output
+                }
+                RETURN output LIMIT 50
+                """,
+                {"query": generate_full_text_query(entity)},
+            )
+            result += "\n".join([el['output'] for el in response])
+        return result
+
+    def retriever(self, question: str):
+        print(f"Search query: {question}")
+        structured_data = self.structured_retriever(question)
+        unstructured_data = [el.page_content for el in self.vector_index.similarity_search(question)]
+        final_data = f"""Structured data: {structured_data}
+Unstructured data:
+{"#Document ".join(unstructured_data)}
+        """
+        return final_data
+
+    @staticmethod
+    def format_chat_history(chat_history: List[Tuple[str, str]]) -> List:
+        buffer = []
+        for human, ai in chat_history:
+            buffer.append(HumanMessage(content=human))
+            buffer.append(AIMessage(content=ai))
+        return buffer
+
+    def extract_sql_from_response(self, response_content):
+        code_block_pattern = r"```sql(.*?)```"
+        code_match = re.search(code_block_pattern, response_content, re.DOTALL)
+
+        if code_match:
+            sql_query = code_match.group(1).strip()
+        else:
+            sql_patterns = [r"\bSELECT\b", r"\bWITH\b", r"\bINSERT\b", r"\bUPDATE\b", r"\bDELETE\b"]
+            sql_query = None
+            for pattern in sql_patterns:
+                match = re.search(pattern, response_content, re.IGNORECASE)
+                if match:
+                    sql_query = response_content[match.start():].strip()
+                    break
+        return sql_query
+
+    def extract_sql_from_response(self, response_content):
+        """
+        Extracts the SQL query from the response content. The SQL query is expected to be enclosed
+        within triple backticks (```).
+
+        :param response_content: The full response from the LLM which contains the SQL query.
+        :return: The extracted SQL query as a string, or None if extraction fails.
+        """
+
+        # Use a regular expression to find SQL queries enclosed in triple backticks
+        pattern = r"```(?:sql)?\n(.*?)```"
+        match = re.search(pattern, response_content, re.DOTALL)
+
+        if match:
+            # Extract and return the SQL query, trimming any extra whitespace
+            sql_query = match.group(1).strip()
+            return sql_query
+        else:
+            print("Failed to extract SQL query from response.")
+            return None
+
+    def generate_sql_query(self, table_column_info, user_query):
+        print('In Generate query', table_column_info)
+
+        # Check if table_column_info is a JSON string and convert to dictionary
+        if isinstance(table_column_info, str):
+            try:
+                table_column_info = json.loads(table_column_info)
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse JSON string into dictionary. Error: {e}")
+                return None
+
+        # Ensure table_column_info contains a 'tables' key
+        if "tables" not in table_column_info or not isinstance(table_column_info["tables"], list):
+            print("Invalid table_column_info format. Expected a list of tables under 'tables' key.")
+            return None
+
+        formatted_table_column_info = "\n\n".join(
+            f"Table: {table_info['table']}\nColumns: {', '.join([col['column_name'] for col in table_info['columns']])}"
+            for table_info in table_column_info['tables']
+        )
+
+        system_prompt = (
+            f"You have been provided with the following table and column information:\n"
+            f"{formatted_table_column_info}\n\n"
+            "Based on the user's question:\n"
+            f"{user_query}\n\n"
+            "Generate a valid SQL query using only these tables and columns. "
+            "Ensure that the query answers the user's question accurately. "
+            "The SQL query should be enclosed within triple backticks as a code block."
+        )
+
+        messages = [
+            HumanMessage(content=system_prompt)
+        ]
+
+        # Call the LLM to generate the SQL query
+        response = self.llm(messages=messages)
+        response_content = response.text.strip() if hasattr(response, 'text') else response.content.strip()
+
+        # Extract the SQL query from the response content
+        sql_query = self.extract_sql_from_response(response_content)
+
+        print(f"Response Content: {response_content}")
+        print(f"Extracted SQL Query: {sql_query}")
+
+        if sql_query:
+            return sql_query
+        else:
+            print("Failed to generate a valid SQL query.")
+            return None
+
+    def execute_sql_query(self, query):
+        print(f"Executing SQL Query: {query}")
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(query)
+            result = cursor.fetchall()
+            return result
+        except sqlite3.OperationalError as e:
+            print(f"SQL Error: {e}")
+            return None
+        except Exception as e:
+            print(f"Unexpected Error: {e}")
+            return None
+
+
+def main():
+   pipeline = GraphRAGPipeline()
+   pipeline.setup()
+
+   text_files = ["/content/Chinook_metadata.txt"]
+   db_path = '/content/Chinook 1.db'
+  #  documents = pipeline.load_and_split_documents(text_files)
+  #  pipeline.add_documents_to_graph(documents)
+
+   prompt_1 = ChatPromptTemplate.from_messages([
+        ("system", "You are extracting entities."),
+        ("human", "Extract from {question}")
+    ])
+   entity_chain = prompt_1 | pipeline.llm.with_structured_output(EntityExtractor)
+
+   retriever = Retriever(pipeline.graph, entity_chain, db_path)
+   retriever.llm = pipeline.llm
+
+   _template = """Given the following conversation and a follow-up question, rephrase the follow-up question to be a standalone question,
+    in its original language.
+    Chat History:
+    {chat_history}
+    Follow Up Input: {question}
+    Standalone question:"""
+   CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(_template)
+
+   template = """Answer the question based only on the following context:
+    {context}
+
+    Question: {question}
+    Give me only the relevant table names and all the columns associated with them based on the user's query.
+    Generate the result strictly in json format, if possible also get brief description of table and columns.
+    Here is a sample json format, retrieve the result strictly in the below format only:
+    {{
+  "tables": [
+    {{
+      "table": "employees",
+      "description": "Table containing information about employees",
+      "columns": [
+        {{
+          "column_name": "EmployeeId",
+          "description": "Unique identifier for the employee"
+        }},
+        {{
+          "column_name": "FirstName",
+          "description": "Employee’s first name"
+        }},
+        {{
+          "column_name": "LastName",
+          "description": "Employee’s last name"
+        }},
+        {{
+          "column_name": "Title",
+          "description": "Employee’s job title"
+        }},
+        {{
+          "column_name": "ReportsTo",
+          "description": "Reference to the employee’s supervisor"
+        }},
+        {{
+          "column_name": "BirthDate",
+          "description": "Employee’s birthdate"
+        }},
+        {{
+          "column_name": "HireDate",
+          "description": "Date the employee was hired"
+        }},
+        {{
+          "column_name": "Address",
+          "description": "Employee’s address"
+        }},
+        {{
+          "column_name": "City",
+          "description": "City of the employee"
+        }},
+        {{
+          "column_name": "State",
+          "description": "State of the employee"
+        }},
+        {{
+          "column_name": "Country",
+          "description": "Country of the employee"
+        }},
+        {{
+          "column_name": "PostalCode",
+          "description": "Postal code of the employee"
+        }},
+        {{
+          "column_name": "Phone",
+          "description": "Employee’s phone number"
+        }},
+        {{
+          "column_name": "Email",
+          "description": "Employee’s email address"
+        }}
+      ]
+    }}
+  ]
+}}
+    Answer:"""
+   prompt = ChatPromptTemplate.from_template(template)
+
+   _search_query = RunnableBranch(
+        (
+            RunnableLambda(lambda x: bool(x.get("chat_history"))).with_config(
+                run_name="HasChatHistoryCheck"
+            ),
+            RunnablePassthrough.assign(
+                chat_history=lambda x: Retriever.format_chat_history(x["chat_history"])
+            )
+            | CONDENSE_QUESTION_PROMPT
+            | retriever.llm
+            | StrOutputParser(),
+        ),
+        RunnableLambda(lambda x: x["question"]),
+    )
+
+   chain = (
+            RunnableParallel(
+                {
+                    "context": _search_query | retriever.retriever,
+                    "question": RunnablePassthrough(),
+                }
+            )
+            | prompt
+            | retriever.llm
+            | StrOutputParser()
+    )
+   user_query="Find all customers who have purchased tracks from multiple genres, and list their names along with the genres they have purchased from"
+
+   result = chain.invoke({"question": user_query, "context": "Please retrieve the table and columns"})
+   print(result)
+   query = retriever.generate_sql_query(result , user_query)
+   print(query)
+   output = retriever.execute_sql_query(query)
+   print(output)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
